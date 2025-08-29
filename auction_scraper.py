@@ -128,7 +128,73 @@ def extract_pdf_details(pdf_url):
         temp_file = "temp_notice.pdf"
         with open(temp_file, "wb") as f:
             f.write(resp.content)
+
         text = ""
         with pdfplumber.open(temp_file) as pdf:
             for page in pdf.pages:
-                txt
+                txt = page.extract_text() or ""
+                text += "\n" + txt
+
+        # Date: look for mm/dd/yyyy
+        m = re.search(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", text)
+        if m:
+            details["date"] = m.group(0)
+
+        # Location: crude match for courthouse/office
+        if "courthouse" in text.lower():
+            details["location"] = "Courthouse"
+        elif "sheriff" in text.lower():
+            details["location"] = "Sheriff's Office"
+
+        # Property: look for Parcel, Lot, or Address-like text
+        pm = re.search(r"(Parcel\s*\d+|Lot\s*\d+|Address:\s*.+)", text)
+        if pm:
+            details["property"] = pm.group(0)
+
+    except Exception as e:
+        print(f"PDF parse error: {e}")
+    return details
+
+def scrape_auctions():
+    s = make_session()
+    results = []
+    for county, url in COUNTY_SITES.items():
+        results.extend(scrape_page(s, county, url))
+    # Deduplicate by link
+    deduped, seen = [], set()
+    for r in results:
+        if r["link"] not in seen:
+            deduped.append(r)
+            seen.add(r["link"])
+    return deduped
+
+def write_csv(rows):
+    os.makedirs("output", exist_ok=True)
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    path = os.path.join("output", f"auctions_{today}.csv")
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["date", "county", "title", "auction_date", "auction_location", "property_details", "link"])
+        for r in rows:
+            w.writerow([
+                today,
+                r["county"],
+                r["title"],
+                r.get("date", ""),
+                r.get("location", ""),
+                r.get("property", ""),
+                r["link"],
+            ])
+    return path
+
+if __name__ == "__main__":
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    auctions = scrape_auctions()
+    print(f"Auction Results for {today}")
+    print("=" * 60)
+    if not auctions:
+        print("No matches yet. Next step: plug in each county’s EXACT auction page URL.")
+    for a in auctions:
+        print(f"{a['county']} — {a['title']} | Date: {a['date']} | Location: {a['location']} | Property: {a['property']} ({a['link']})")
+    csv_path = write_csv(auctions)
+    print(f"\nSaved {len(auctions)} rows to: {csv_path}")
