@@ -7,44 +7,57 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ⛳ Replace these with the ACTUAL official auction pages you want.
-# Some of the ones we tried were placeholders or 404s.
+# Keep only the counties that are reachable & useful right now.
+# We'll re-enable others once we have their exact auction pages.
 COUNTY_SITES = {
-    "Benton County": "https://bentoncountyar.gov/",            # TODO: put exact auction page URL
-    "Washington County": "https://www.washingtoncountyar.gov/",# TODO
-    "Sebastian County": "https://www.sebastiancountyar.gov/",  # TODO
-    "Crawford County": "https://www.crawfordcountyar.gov/",    # TODO
-    "Pulaski County": "https://pulaskicounty.net/",            # TODO (note: different domain)
-    "Franklin County": "https://www.franklincountyar.gov/",    # TODO
-    "Johnson County": "https://johnsoncountyar.gov/",          # TODO (note: no 'www.')
+    # ✅ Working / yields relevant links
+    "Sebastian County": "https://www.sebastiancountyar.gov/",
+    "Pulaski County": "https://www.pulaskicounty.net/",
+    "Crawford County": "https://www.crawfordcountyar.gov/",
+    "Franklin County": "https://franklincountyar.gov/",
+    # 🚫 Temporarily disabled (commented) due to errors you saw
+    # "Benton County": "https://bentoncountyar.gov/",
+    # "Washington County": "https://www.washingtoncountyar.gov/",
+    # "Johnson County": "https://johnsoncountyar.gov/",
 }
 
-KEYWORDS = ("auction", "sheriff", "sale", "foreclosure", "tax", "trustee", "notice")
+# Only keep links that look like auctions / sales / public notices
+INCLUDE_HINTS = (
+    "auction", "commissioner", "sheriff", "sale", "foreclosure",
+    "tax sale", "public notice", "trustee",
+)
+
+# Exclude obvious noise (inmate, taxes portal, generic sheriff pages, etc.)
+EXCLUDE_HINTS = (
+    "inmate", "detention", "jail", "visitation", "k9",
+    "pay-taxes", "treasurer", "taxes", "forms", "faq", "resources",
+    "records", "jobs", "careers", "swat", "juvenile", "security",
+)
+
+# Prioritize documents and news/detail pages
+DOC_EXT = (".pdf", ".doc", ".docx")
 
 def make_session():
-    sess = requests.Session()
+    s = requests.Session()
     retries = Retry(
-        total=3,
-        connect=3,
-        read=3,
+        total=3, connect=3, read=3,
         backoff_factor=0.8,
         status_forcelist=(429, 500, 502, 503, 504),
         raise_on_status=False,
-        allowed_methods=frozenset(["GET", "HEAD"])
+        allowed_methods=frozenset(["GET", "HEAD"]),
     )
     adapter = HTTPAdapter(max_retries=retries)
-    sess.mount("https://", adapter)
-    sess.mount("http://", adapter)
-    sess.headers.update({
-        # Friendly browser-like headers
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    s.headers.update({
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                        "AppleWebKit/537.36 (KHTML, like Gecko) "
                        "Chrome/124.0.0.0 Safari/537.36"),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "close"
+        "Connection": "close",
     })
-    return sess
+    return s
 
 def dns_ok(url: str) -> bool:
     try:
@@ -54,34 +67,52 @@ def dns_ok(url: str) -> bool:
     except Exception:
         return False
 
+def looks_relevant(text: str, href: str) -> bool:
+    t = (text or "").lower()
+    h = (href or "").lower()
+    if any(x in t or x in h for x in INCLUDE_HINTS):
+        if not any(x in t or x in h for x in EXCLUDE_HINTS):
+            return True
+    # allow direct docs with likely content even if text is short
+    if h.endswith(DOC_EXT) and not any(x in h for x in EXCLUDE_HINTS):
+        return True
+    return False
+
+def same_site(full: str, base: str) -> bool:
+    return urlparse(full).netloc.split(":")[0].endswith(
+        urlparse(base).netloc.split(":")[0]
+    )
+
 def scrape_page(sess: requests.Session, county: str, url: str):
     out = []
     if not dns_ok(url):
         print(f"[{county}] DNS could not resolve host for URL: {url}")
         return out
-
     try:
         resp = sess.get(url, timeout=20, allow_redirects=True)
+        if resp.status_code == 403:
+            print(f"[{county}] HTTP 403 (blocked). We may need the county's exact auction page.")
+            return out
         if resp.status_code >= 400:
             print(f"[{county}] HTTP {resp.status_code} for {url}")
             return out
 
         soup = BeautifulSoup(resp.text, "html.parser")
+        seen = set()
 
-        # Grab links and keep those that look relevant
         for a in soup.find_all("a", href=True):
-            text = (a.get_text(" ", strip=True) or "").lower()
-            href = a["href"]
-            full = urljoin(resp.url, href)
-            # Keep links on same site or obvious document links
-            same_host = urlparse(full).netloc.endswith(urlparse(resp.url).netloc.split(":")[0])
-            looks_relevant = any(k in text for k in KEYWORDS) or any(k in full.lower() for k in KEYWORDS)
-            if looks_relevant and (same_host or full.lower().endswith((".pdf", ".doc", ".docx"))):
-                out.append({"county": county, "title": a.get_text(strip=True), "link": full})
+            title = a.get_text(" ", strip=True)
+            full = urljoin(resp.url, a["href"])
+            key = (title, full)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            if looks_relevant(title, full) and (same_site(full, resp.url) or full.lower().endswith(DOC_EXT)):
+                out.append({"county": county, "title": title or "(no title)", "link": full})
+
         return out
 
-    except requests.exceptions.SSLError as e:
-        print(f"[{county}] SSL error: {e}")
     except requests.exceptions.ConnectionError as e:
         print(f"[{county}] Connection error: {e}")
     except requests.exceptions.Timeout:
@@ -91,12 +122,18 @@ def scrape_page(sess: requests.Session, county: str, url: str):
     return out
 
 def scrape_auctions():
-    sess = make_session()
+    s = make_session()
     results = []
     for county, url in COUNTY_SITES.items():
-        items = scrape_page(sess, county, url)
-        results.extend(items)
-    return results
+        results.extend(scrape_page(s, county, url))
+    # final dedupe by link
+    deduped = []
+    seen_links = set()
+    for r in results:
+        if r["link"] not in seen_links:
+            deduped.append(r)
+            seen_links.add(r["link"])
+    return deduped
 
 if __name__ == "__main__":
     today = datetime.date.today().strftime("%Y-%m-%d")
@@ -104,6 +141,6 @@ if __name__ == "__main__":
     print(f"Auction Results for {today}")
     print("=" * 60)
     if not auctions:
-        print("No matches found yet. Verify the county URLs point to the actual auction page.")
+        print("No matches yet. Next step: plug in each county’s EXACT auction page URL.")
     for a in auctions:
         print(f"{a['county']} — {a['title']} ({a['link']})")
