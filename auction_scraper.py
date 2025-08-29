@@ -1,4 +1,6 @@
 import datetime
+import csv
+import os
 import socket
 from urllib.parse import urljoin, urlparse
 
@@ -7,34 +9,25 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# Keep only the counties that are reachable & useful right now.
-# We'll re-enable others once we have their exact auction pages.
 COUNTY_SITES = {
-    # ✅ Working / yields relevant links
     "Sebastian County": "https://www.sebastiancountyar.gov/",
     "Pulaski County": "https://www.pulaskicounty.net/",
     "Crawford County": "https://www.crawfordcountyar.gov/",
     "Franklin County": "https://franklincountyar.gov/",
-    # 🚫 Temporarily disabled (commented) due to errors you saw
     # "Benton County": "https://bentoncountyar.gov/",
     # "Washington County": "https://www.washingtoncountyar.gov/",
     # "Johnson County": "https://johnsoncountyar.gov/",
 }
 
-# Only keep links that look like auctions / sales / public notices
 INCLUDE_HINTS = (
     "auction", "commissioner", "sheriff", "sale", "foreclosure",
     "tax sale", "public notice", "trustee",
 )
-
-# Exclude obvious noise (inmate, taxes portal, generic sheriff pages, etc.)
 EXCLUDE_HINTS = (
     "inmate", "detention", "jail", "visitation", "k9",
     "pay-taxes", "treasurer", "taxes", "forms", "faq", "resources",
     "records", "jobs", "careers", "swat", "juvenile", "security",
 )
-
-# Prioritize documents and news/detail pages
 DOC_EXT = (".pdf", ".doc", ".docx")
 
 def make_session():
@@ -46,9 +39,8 @@ def make_session():
         raise_on_status=False,
         allowed_methods=frozenset(["GET", "HEAD"]),
     )
-    adapter = HTTPAdapter(max_retries=retries)
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
+    s.mount("https://", HTTPAdapter(max_retries=retries))
+    s.mount("http://", HTTPAdapter(max_retries=retries))
     s.headers.update({
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                        "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -73,7 +65,6 @@ def looks_relevant(text: str, href: str) -> bool:
     if any(x in t or x in h for x in INCLUDE_HINTS):
         if not any(x in t or x in h for x in EXCLUDE_HINTS):
             return True
-    # allow direct docs with likely content even if text is short
     if h.endswith(DOC_EXT) and not any(x in h for x in EXCLUDE_HINTS):
         return True
     return False
@@ -91,7 +82,7 @@ def scrape_page(sess: requests.Session, county: str, url: str):
     try:
         resp = sess.get(url, timeout=20, allow_redirects=True)
         if resp.status_code == 403:
-            print(f"[{county}] HTTP 403 (blocked). We may need the county's exact auction page.")
+            print(f"[{county}] HTTP 403 (blocked). Use the county's exact auction page.")
             return out
         if resp.status_code >= 400:
             print(f"[{county}] HTTP {resp.status_code} for {url}")
@@ -99,20 +90,16 @@ def scrape_page(sess: requests.Session, county: str, url: str):
 
         soup = BeautifulSoup(resp.text, "html.parser")
         seen = set()
-
         for a in soup.find_all("a", href=True):
-            title = a.get_text(" ", strip=True)
+            title = a.get_text(" ", strip=True) or "(no title)"
             full = urljoin(resp.url, a["href"])
             key = (title, full)
             if key in seen:
                 continue
             seen.add(key)
-
             if looks_relevant(title, full) and (same_site(full, resp.url) or full.lower().endswith(DOC_EXT)):
-                out.append({"county": county, "title": title or "(no title)", "link": full})
-
+                out.append({"county": county, "title": title, "link": full})
         return out
-
     except requests.exceptions.ConnectionError as e:
         print(f"[{county}] Connection error: {e}")
     except requests.exceptions.Timeout:
@@ -126,14 +113,24 @@ def scrape_auctions():
     results = []
     for county, url in COUNTY_SITES.items():
         results.extend(scrape_page(s, county, url))
-    # final dedupe by link
-    deduped = []
-    seen_links = set()
+    # Deduplicate by link
+    deduped, seen = [], set()
     for r in results:
-        if r["link"] not in seen_links:
+        if r["link"] not in seen:
             deduped.append(r)
-            seen_links.add(r["link"])
+            seen.add(r["link"])
     return deduped
+
+def write_csv(rows):
+    os.makedirs("output", exist_ok=True)
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    path = os.path.join("output", f"auctions_{today}.csv")
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["date", "county", "title", "link"])
+        for r in rows:
+            w.writerow([today, r["county"], r["title"], r["link"]])
+    return path
 
 if __name__ == "__main__":
     today = datetime.date.today().strftime("%Y-%m-%d")
@@ -144,3 +141,5 @@ if __name__ == "__main__":
         print("No matches yet. Next step: plug in each county’s EXACT auction page URL.")
     for a in auctions:
         print(f"{a['county']} — {a['title']} ({a['link']})")
+    csv_path = write_csv(auctions)
+    print(f"\nSaved {len(auctions)} rows to: {csv_path}")
