@@ -2,18 +2,21 @@ import datetime
 import csv
 import os
 import socket
+import re
 from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import pdfplumber
 
 COUNTY_SITES = {
     "Sebastian County": "https://www.sebastiancountyar.gov/",
     "Pulaski County": "https://www.pulaskicounty.net/",
     "Crawford County": "https://www.crawfordcountyar.gov/",
     "Franklin County": "https://franklincountyar.gov/",
+    # Disabled until correct URLs provided:
     # "Benton County": "https://bentoncountyar.gov/",
     # "Washington County": "https://www.washingtoncountyar.gov/",
     # "Johnson County": "https://johnsoncountyar.gov/",
@@ -98,7 +101,17 @@ def scrape_page(sess: requests.Session, county: str, url: str):
                 continue
             seen.add(key)
             if looks_relevant(title, full) and (same_site(full, resp.url) or full.lower().endswith(DOC_EXT)):
-                out.append({"county": county, "title": title, "link": full})
+                details = {"date": "", "location": "", "property": ""}
+                if full.lower().endswith(".pdf"):
+                    details = extract_pdf_details(full)
+                out.append({
+                    "county": county,
+                    "title": title,
+                    "link": full,
+                    "date": details["date"],
+                    "location": details["location"],
+                    "property": details["property"]
+                })
         return out
     except requests.exceptions.ConnectionError as e:
         print(f"[{county}] Connection error: {e}")
@@ -108,38 +121,14 @@ def scrape_page(sess: requests.Session, county: str, url: str):
         print(f"[{county}] Unexpected error: {e}")
     return out
 
-def scrape_auctions():
-    s = make_session()
-    results = []
-    for county, url in COUNTY_SITES.items():
-        results.extend(scrape_page(s, county, url))
-    # Deduplicate by link
-    deduped, seen = [], set()
-    for r in results:
-        if r["link"] not in seen:
-            deduped.append(r)
-            seen.add(r["link"])
-    return deduped
-
-def write_csv(rows):
-    os.makedirs("output", exist_ok=True)
-    today = datetime.date.today().strftime("%Y-%m-%d")
-    path = os.path.join("output", f"auctions_{today}.csv")
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["date", "county", "title", "link"])
-        for r in rows:
-            w.writerow([today, r["county"], r["title"], r["link"]])
-    return path
-
-if __name__ == "__main__":
-    today = datetime.date.today().strftime("%Y-%m-%d")
-    auctions = scrape_auctions()
-    print(f"Auction Results for {today}")
-    print("=" * 60)
-    if not auctions:
-        print("No matches yet. Next step: plug in each county’s EXACT auction page URL.")
-    for a in auctions:
-        print(f"{a['county']} — {a['title']} ({a['link']})")
-    csv_path = write_csv(auctions)
-    print(f"\nSaved {len(auctions)} rows to: {csv_path}")
+def extract_pdf_details(pdf_url):
+    details = {"date": "", "location": "", "property": ""}
+    try:
+        resp = requests.get(pdf_url, timeout=20)
+        temp_file = "temp_notice.pdf"
+        with open(temp_file, "wb") as f:
+            f.write(resp.content)
+        text = ""
+        with pdfplumber.open(temp_file) as pdf:
+            for page in pdf.pages:
+                txt
