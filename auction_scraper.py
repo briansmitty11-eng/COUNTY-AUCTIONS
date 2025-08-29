@@ -15,13 +15,17 @@ import pdfplumber
 # Save everything next to this script (Desktop).
 BASE_DIR = pathlib.Path(__file__).resolve().parent
 
-# Exact county pages (tune as you confirm your targets)
+# Only these six counties
 COUNTY_SITES = {
-    "Pulaski County": "https://pulaskiclerkar.gov/auction-about/auction-notices/",
-    "Sebastian County": "https://www.sebastiancountyar.gov/Departments/Circuit-Clerk/Commissioners-Sales",
-    "Crawford County": "https://www.crawfordcountyar.gov/officials/circuit_clerk.cshtml",
-    "Benton County": "https://bentoncountyar.gov/circuit-clerk/judicial-sales-and-foreclosures/",
-    "Washington County": "https://www.washingtoncountyar.gov/how-do-i/view/foreclosure-information",
+    # Arkansas
+    "Sebastian County, AR": "https://www.sebastiancountyar.gov/Departments/Circuit-Clerk/Commissioners-Sales",
+    "Crawford County, AR":  "https://www.crawfordcountyar.gov/officials/circuit_clerk.cshtml",
+    "Scott County, AR":     "https://www.arcounties.org/counties/scott/",
+
+    # Oklahoma
+    "Sequoyah County, OK":  "https://sequoyahcountyok.org/foreclosures.html",
+    "LeFlore County, OK":   "https://leflorecounty.org/sheriff-sales.html",
+    "Adair County, OK":     "https://adaircountyok.gov/sheriff-sales.html",
 }
 # ============================================================
 
@@ -105,69 +109,54 @@ def extract_addresses_from_html(soup: BeautifulSoup):
     return find_addresses_in_text(text)
 
 # ---------- site parsers ----------
-def parse_pulaski(sess, url, county, pdf_dir: pathlib.Path):
-    rows = []
+def parse_pdf_listing(sess, url, county, pdf_dir: pathlib.Path):
+    """
+    For pages that directly list sale PDFs (Sebastian/Crawford/OK sheriff pages if they use PDFs).
+    """
+    out = []
     r = sess.get(url, timeout=25)
     if r.status_code >= 400:
-        return rows
+        return out
     soup = BeautifulSoup(r.text, "html.parser")
-
-    # Detail pages usually start with /auction-
-    links = set()
-    for a in soup.select('a[href]'):
+    # Collect obvious PDFs
+    pdfs = {urljoin(url, a.get("href")) for a in soup.select('a[href$=".pdf"]') if a.get("href")}
+    # Some pages use non-.pdf links that still return PDFs; pick up likely sale links too:
+    for a in soup.select("a[href]"):
         href = a.get("href", "")
-        if "/auction-" in href:
-            links.add(urljoin(url, href))
-
-    for href in links:
-        d = sess.get(href, timeout=25)
-        if d.status_code >= 400:
+        if not href:
             continue
-        ds = BeautifulSoup(d.text, "html.parser")
-        addresses = extract_addresses_from_html(ds)
+        full = urljoin(url, href)
+        text = (a.get_text(strip=True) or "").lower()
+        if any(k in text for k in ("auction", "sale", "sheriff", "foreclosure", "commissioner", "trustee")):
+            pdfs.add(full)
 
-        # PDFs on the detail page
-        for a in ds.select('a[href$=".pdf"]'):
-            purl = urljoin(href, a.get("href"))
-            saved = download_pdf(sess, purl, pdf_dir, hint=f"{county} - {pathlib.Path(urlparse(purl).path).name}")
-            if saved:
-                addresses += extract_addresses_from_pdf(saved)
-
-        for addr in dict.fromkeys(addresses):  # dedupe
-            rows.append({
+    for pdf_url in pdfs:
+        saved = download_pdf(sess, pdf_url, pdf_dir, hint=f"{county} - {pathlib.Path(urlparse(pdf_url).path).name}")
+        if not saved:
+            # If not a PDF, skip parsing
+            if not pdf_url.lower().endswith(".pdf"):
+                continue
+        addrs = extract_addresses_from_pdf(saved) if saved else []
+        for addr in addrs:
+            out.append({
                 "county": county,
                 "address": addr,
                 "maps": f"https://www.google.com/maps/search/?api=1&query={quote(addr)}",
-                "source": href
+                "source": pdf_url
             })
-    return rows
-
-def parse_pdf_listing(sess, url, county, pdf_dir: pathlib.Path):
-    out = []
-    r = sess.get(url, timeout=25)
-    if r.status_code >= 400:
-        return out
-    soup = BeautifulSoup(r.text, "html.parser")
-    for a in soup.select('a[href$=".pdf"]'):
-        full = urljoin(url, a.get("href"))
-        saved = download_pdf(sess, full, pdf_dir, hint=f"{county} - {pathlib.Path(urlparse(full).path).name}")
-        if saved:
-            for addr in extract_addresses_from_pdf(saved):
-                out.append({
-                    "county": county,
-                    "address": addr,
-                    "maps": f"https://www.google.com/maps/search/?api=1&query={quote(addr)}",
-                    "source": full
-                })
     return out
 
 def generic_page(sess, url, county, pdf_dir: pathlib.Path):
+    """
+    Fallback for pages that might have addresses in HTML + linked PDFs.
+    """
     out = []
     r = sess.get(url, timeout=25)
     if r.status_code >= 400:
         return out
     soup = BeautifulSoup(r.text, "html.parser")
-    # try HTML text
+
+    # Addresses present in page text
     for addr in extract_addresses_from_html(soup):
         out.append({
             "county": county,
@@ -175,7 +164,8 @@ def generic_page(sess, url, county, pdf_dir: pathlib.Path):
             "maps": f"https://www.google.com/maps/search/?api=1&query={quote(addr)}",
             "source": url
         })
-    # plus any PDFs on the page
+
+    # Any PDFs found on page
     for a in soup.select('a[href$=".pdf"]'):
         href = urljoin(url, a.get("href"))
         saved = download_pdf(sess, href, pdf_dir, hint=f"{county} - {pathlib.Path(urlparse(href).path).name}")
@@ -200,12 +190,10 @@ def scrape():
     for county, url in COUNTY_SITES.items():
         host = urlparse(url).netloc
         try:
-            if "pulaskiclerkar.gov" in host:
-                results.extend(parse_pulaski(s, url, county, pdf_dir))
-            elif "sebastiancountyar.gov" in host or "crawfordcountyar.gov" in host:
-                results.extend(parse_pdf_listing(s, url, county, pdf_dir))
-            else:
-                results.extend(generic_page(s, url, county, pdf_dir))
+            # Assume Sebastian/Crawford/OK pages mostly publish PDFs; try pdf-listing first
+            results.extend(parse_pdf_listing(s, url, county, pdf_dir))
+            # As a backup, also scan HTML and any on-page PDFs
+            results.extend(generic_page(s, url, county, pdf_dir))
         except Exception as e:
             print(f"[{county}] Error: {e}")
 
@@ -264,3 +252,12 @@ if __name__ == "__main__":
     print(f"\nSaved CSV  → {csv_path}")
     print(f"Saved HTML → {html_path}")
     print("PDFs saved in folder:", BASE_DIR / f"Auctions_PDFs_{today}")
+
+    # Auto-open the HTML dashboard on Windows
+    try:
+        import time
+        time.sleep(1)
+        os.startfile(html_path)
+    except Exception:
+        pass
+
